@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>  // file operations
 #include <cstdlib>
 #include <chrono>
 #include <ctime>
@@ -7,12 +8,80 @@
 #include "json.hpp" // json handling
 #include "mqtt/client.h" // paho mqtt
 #include <iomanip>
+#include <sstream>
+#include <sys/sysinfo.h>
 
 #define QOS 1
 #define BROKER_ADDRESS "tcp://localhost:1883"
 
+using namespace std;
+
+string getMachineId() {
+    char hostname[1024];
+    gethostname(hostname, 1024);
+    return string(hostname);
+}
+
+long getUsedRAM() {
+    struct sysinfo info;
+
+    if (sysinfo(&info) != 0) {
+        std::cerr << "Error getting system information" << std::endl;
+        return -1;
+    }
+
+    // Calculate used RAM (total RAM - free RAM)
+    double usedRAMInMB = static_cast<double>(info.totalram - info.freeram) / (1024 * 1024);
+
+    return usedRAMInMB;
+}
+
+// Function to get CPU usage as a percentage
+double getCPUUsage() {
+    static long long lastTotalUser, lastTotalUserLow, lastTotalSys, lastTotalIdle;
+
+    std::ifstream fileStat("/proc/stat");
+    std::string line;
+
+    if (!fileStat.is_open()) {
+        std::cerr << "Error opening /proc/stat" << std::endl;
+        return -1.0;
+    }
+
+    // Read the first line from /proc/stat
+    std::getline(fileStat, line);
+    std::istringstream ss(line);
+
+    // Skip the "cpu" prefix
+    std::string cpuLabel;
+    ss >> cpuLabel;
+
+    // Read CPU time values
+    long long user, nice, sys, idle, iowait, irq, softirq, steal, guest, guest_nice;
+    ss >> user >> nice >> sys >> idle >> iowait >> irq >> softirq >> steal >> guest >> guest_nice;
+
+    // Calculate total CPU time
+    long long totalUser = user - lastTotalUser;
+    long long totalUserLow = nice - lastTotalUserLow;
+    long long totalSys = sys - lastTotalSys;
+    long long totalIdle = idle - lastTotalIdle;
+    long long total = totalUser + totalUserLow + totalSys + totalIdle;
+
+    // Calculate CPU usage percentage
+    double cpuUsage = (static_cast<double>(total - totalIdle) / total) * 100.0;
+
+    // Update last values for the next calculation
+    lastTotalUser = user;
+    lastTotalUserLow = nice;
+    lastTotalSys = sys;
+    lastTotalIdle = idle;
+
+    return cpuUsage;
+}
+
 int main(int argc, char* argv[]) {
-    std::string clientId = "sensor-monitor";
+    
+    string clientId = "sensor-monitor";
     mqtt::client client(BROKER_ADDRESS, clientId);
 
     // Connect to the MQTT broker.
@@ -23,41 +92,56 @@ int main(int argc, char* argv[]) {
     try {
         client.connect(connOpts);
     } catch (mqtt::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        cerr << "Error: " << e.what() << endl;
         return EXIT_FAILURE;
     }
-    std::clog << "connected to the broker" << std::endl;
+    clog << "connected to the broker" << endl;
 
     // Get the unique machine identifier, in this case, the hostname.
-    char hostname[1024];
-    gethostname(hostname, 1024);
-    std::string machineId(hostname);
+    std::string machineId = getMachineId();
+
+    // Initial message
+    nlohmann::json initialMessage;
+    initialMessage["machine_id"] = machineId;
+    initialMessage["sensors"] = {
+        {
+            {"sensor_id", "cpu_temperature"},
+            {"data_type", "int"},
+            {"data_interval", 1000}  // Example interval in milliseconds
+        },
+        // Add more sensors as needed
+    };
+
+    string initialTopic = "/sensor_monitors";
+    mqtt::message initialMsg(initialTopic, initialMessage.dump(), QOS, false);
+    client.publish(initialMsg);
+    clog << "Initial message published - topic: " << initialTopic << " - message: " << initialMessage.dump() << endl;
 
     while (true) {
        // Get the current time in ISO 8601 format.
-        auto now = std::chrono::system_clock::now();
-        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-        std::tm* now_tm = std::localtime(&now_c);
-        std::stringstream ss;
-        ss << std::put_time(now_tm, "%FT%TZ");
-        std::string timestamp = ss.str();
+        auto now = chrono::system_clock::now();
+        time_t now_c = chrono::system_clock::to_time_t(now);
+        tm* now_tm = localtime(&now_c);
+        stringstream ss;
+        ss << put_time(now_tm, "%FT%TZ");
+        string timestamp = ss.str();
 
         // Generate a random value.
-        int value = rand();
-
+        long ramUsed = getUsedRAM();
+        
         // Construct the JSON message.
         nlohmann::json j;
         j["timestamp"] = timestamp;
-        j["value"] = value;
+        j["ram_used"] = ramUsed;  // Convert to float
 
-        // Publish the JSON message to the appropriate topic.
-        std::string topic = "/sensors/" + machineId + "/rand";
+        // // Publish the JSON message to the appropriate topic.
+        std::string topic = "/sensors/" + machineId + "/ram_used";
         mqtt::message msg(topic, j.dump(), QOS, false);
-        std::clog << "message published - topic: " << topic << " - message: " << j.dump() << std::endl;
+        clog << "message published - topic: " << topic << " - message: " << j.dump() << endl;
         client.publish(msg);
 
         // Sleep for some time.
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        this_thread::sleep_for(chrono::seconds(1));
     }
 
     return EXIT_SUCCESS;
